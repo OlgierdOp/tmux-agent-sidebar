@@ -25,7 +25,7 @@ import time
 
 LANG = "en"
 SIDEBAR_WIDTH = int(os.environ.get("AGENT_SIDEBAR_WIDTH", "42"))
-SEL_BG = 60                 # default selection background (xterm-256), overridden by @agent_sidebar_bg
+SEL_BG = 23                 # default selection background (xterm-256), overridden by @agent_sidebar_bg
 # backgrounds cycled by the `c` key (live preview in all sidebars)
 BG_CHOICES = [60, 61, 24, 25, 23, 29, 22, 53, 54, 89, 52, 94, 17, 18, 235, 236, 237, 238]
 

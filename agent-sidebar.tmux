@@ -3,7 +3,7 @@
 set -gF @agent_sidebar_dir "#{d:current_file}"
 
 # Selection background (xterm-256 color). Pick one live with `c` in the sidebar.
-# set -g @agent_sidebar_bg 60
+# set -g @agent_sidebar_bg 23
 
 # prefix + a   -> show/hide the sidebar (in every window, shared state)
 bind-key a run-shell -b "python3 #{@agent_sidebar_dir}/agent_sidebar.py toggle"

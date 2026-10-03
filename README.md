@@ -116,7 +116,7 @@ Agents are grouped by tmux session. The home session is the session where you tu
 
 | Setting | Where | Default |
 |---------|-------|---------|
-| Selection background | `set -g @agent_sidebar_bg N` in `agent-sidebar.tmux` (xterm-256 color number) | `60` |
+| Selection background | `set -g @agent_sidebar_bg N` in `agent-sidebar.tmux` (xterm-256 color number) | `23` |
 | Sidebar width | `AGENT_SIDEBAR_WIDTH` environment variable | `42` |
 | UI language | `LANG` and `STRINGS` at the top of `agent_sidebar.py` (only `en` for now) | `en` |
 | Key bindings | `agent-sidebar.tmux` | `prefix a`, `prefix Tab` |
