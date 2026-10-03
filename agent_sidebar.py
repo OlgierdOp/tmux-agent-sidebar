@@ -294,6 +294,36 @@ def fmt_tokens(n):
     return f"{n / 1_000_000:.1f}M"
 
 
+# ---------------------------------------------------------------- live state
+
+CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+# state in ~/.claude/sessions/<pid>.json -> sidebar status
+LIVE_STATUS = {"busy": "working", "waiting": "waiting", "idle": "idle"}
+_session_cache = {}
+
+
+def session_state(pid):
+    """(state, since) that Claude Code writes for its process, or None."""
+    path = os.path.join(CLAUDE_DIR, "sessions", f"{pid}.json")
+    try:
+        mtime = os.stat(path).st_mtime_ns
+    except OSError:
+        return None
+    hit = _session_cache.get(pid)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    state = None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if data.get("status") in LIVE_STATUS:
+            state = (data["status"], int((data.get("statusUpdatedAt") or 0) / 1000) or None)
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    _session_cache[pid] = (mtime, state)
+    return state
+
+
 # ---------------------------------------------------------------- model
 
 def current_session(pane=None):
@@ -319,9 +349,20 @@ def collect_agents(home_session=None):
         except ValueError:
             ts = None
         tokens, interrupted = transcript_info(p["@agent_transcript"] or guess_transcript(cwd))
-        if (status in ("working", "waiting") and interrupted
+        live = session_state(pid) if pid else None
+        if live:
+            # Claude Code's own state is exact, also after Esc or Ctrl+C.
+            # The hook adds "done": finished while you did not look.
+            state, since = live
+            new = LIVE_STATUS.get(state)
+            if new == "idle" and status in ("done", "idle"):
+                new = None
+            if new and new != status:
+                status, ts = new, since
+        elif (status in ("working", "waiting") and interrupted
                 and (ts is None or interrupted >= ts + 1)):
-            # interrupted or rejected: no hook runs, so store the change here
+            # older Claude Code without session files: interrupted or rejected,
+            # no hook runs, so store the change here
             status, ts = "idle", int(interrupted)
             tmux("set-option", "-p", "-t", p["pane_id"], "@agent_status", status, ";",
                  "set-option", "-p", "-t", p["pane_id"], "@agent_ts", str(ts))
