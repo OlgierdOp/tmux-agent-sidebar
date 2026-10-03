@@ -141,11 +141,14 @@ To choose a background color, press `c` in the sidebar until you like the color.
 - **Non-blocking UI.** A worker thread collects the agent data (process tree, git, tokens). The main loop only handles keys, `F12` and drawing, so it never waits for the data.
 - **Agent detection.** The sidebar reads `tmux list-panes -a` and the process tree of each pane (`/proc/PID/task/TID/children`, with a full `/proc` scan as fallback). Any pane with a `claude` process in it is an agent.
 - **Status.** Two sources:
-  - Claude Code writes the state of each session (`busy`, `waiting`, `idle`) to `~/.claude/sessions/<pid>.json`. The sidebar finds the `claude` process of the pane and reads this file. The file is correct at once, also after `Esc`, `Ctrl+C` or a rejected permission prompt, when no hook runs.
-  - `hooks/claude-hook.sh` runs on Claude Code hook events. It stores `@agent_status`, `@agent_ts` and `@agent_transcript` as tmux pane options. The hook gives the green "done" status, which the session file does not have.
+  - Claude Code writes the state of each session (`busy`, `waiting`, `idle`) to `~/.claude/sessions/<pid>.json`. The sidebar finds the `claude` process of the pane and reads this file. When the pane runs only a client of a background session (`parkedJobId`), the sidebar reads the file of the background session (`jobId`). The file is correct at once, also after `Esc`, `Ctrl+C` or a rejected permission prompt, when no hook runs.
+  - Every 0.1 s each sidebar checks these files (only a `stat` when nothing changed), so a status change shows in about 50 ms.
+  - When a turn ends (`busy` → `idle`), the last message of the transcript tells how. An assistant reply that ended the turn means "finished": green, or idle when you look at the agent. Your prompt or `[Request interrupted by user]` at the end means you stopped it: idle.
+  - `hooks/claude-hook.sh` runs on Claude Code hook events. It stores `@agent_status`, `@agent_ts` and `@agent_transcript` as tmux pane options. Its `Stop` event also sets "done". No hook runs for a background session.
   - Only a permission prompt or a question makes the dot red. A late notification after the turn ended does not.
   - Without a session file (older Claude Code), the sidebar uses the hook status. It sets idle when the transcript ends with `[Request interrupted by user]`, or when the `idle_prompt` notification comes (after about 60 s).
 - **Tokens.** The context size comes from the `usage` of the last assistant message in the session transcript (input + cache + output tokens).
+- **Name.** The name you give with `n`, else the window name. When tmux names the window automatically (after the command of the active pane), the sidebar uses the repo or directory name.
 - **Git.** The sidebar runs `git rev-parse` in the agent's working directory. `[wt]` marks a linked worktree.
 - **Refresh.** The visible sidebar refreshes its data every 1 s, hidden ones every 5 s. As a safety net, the visible sidebar also polls tmux state every 1 s (hidden: 2 s).
 

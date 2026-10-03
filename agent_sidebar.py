@@ -50,6 +50,7 @@ HIDDEN_POLL_SEC = 2.0
 REFRESH_SEC = 1.0           # data refresh while the pane is visible
 HIDDEN_REFRESH_SEC = 5.0    # ... and while it is hidden
 GIT_TTL_SEC = 3.0
+FINISH_WAIT_SEC = 1.0  # how long a just-ended turn waits for its last transcript entry
 SEP = "\t"
 
 # status -> (symbol, curses color, priority for `next`)
@@ -77,7 +78,7 @@ PANE_FIELDS = [
     "pane_index", "pane_title", "pane_current_path", "pane_active",
     "window_active",
     "@agent_status", "@agent_ts", "@agent_name", "@agent_sidebar",
-    "@agent_transcript",
+    "@agent_transcript", "automatic-rename",
 ]
 
 
@@ -233,25 +234,30 @@ def _entry_time(entry):
         return None
 
 
-def transcript_info(path):
-    """(context tokens, interrupt time) from the transcript.
+FINISH_REASONS = ("end_turn", "stop_sequence", "max_tokens")
 
-    Tokens come from the last assistant reply. The interrupt time is set when
-    the last message of the main chain is "[Request interrupted by user...]":
-    you pressed Esc or rejected a permission prompt. Claude Code runs no hook
-    for this, so the sidebar finds it here."""
+
+def transcript_info(path):
+    """(context tokens, interrupt time, finished) from the transcript.
+
+    Tokens come from the last assistant reply. The last message of the main
+    chain tells how the turn ended:
+    - "[Request interrupted by user...]": you pressed Esc or rejected a
+      permission prompt (interrupt time). Claude Code runs no hook for this.
+    - an assistant reply that ended the turn (finished = True).
+    Esc before the first reply leaves your prompt as the last message."""
     if not path:
-        return None, None
+        return None, None, False
     try:
         st = os.stat(path)
     except OSError:
-        return None, None
+        return None, None, False
     key = (st.st_mtime_ns, st.st_size)
     hit = _token_cache.get(path)
     if hit and hit[0] == key:
         return hit[1]
     tokens = interrupted = None
-    seen_last = False
+    finished = seen_last = False
     try:
         with open(path, "rb") as f:
             f.seek(max(0, st.st_size - 512 * 1024))
@@ -265,13 +271,16 @@ def transcript_info(path):
                 continue
             if entry.get("isSidechain") or entry.get("type") not in ("user", "assistant"):
                 continue
+            message = entry.get("message") or {}
             if not seen_last:
                 seen_last = True
                 if entry["type"] == "user" and INTERRUPT_MARK in line:
                     interrupted = _entry_time(entry)
+                finished = (entry["type"] == "assistant"
+                            and message.get("stop_reason") in FINISH_REASONS)
             if entry["type"] != "assistant":
                 continue
-            u = entry.get("message", {}).get("usage")
+            u = message.get("usage")
             if not u:
                 continue
             tokens = sum(u.get(k) or 0 for k in (
@@ -280,8 +289,9 @@ def transcript_info(path):
             break
     except OSError:
         pass
-    _token_cache[path] = (key, (tokens, interrupted))
-    return tokens, interrupted
+    result = (tokens, interrupted, finished)
+    _token_cache[path] = (key, result)
+    return result
 
 
 def fmt_tokens(n):
@@ -297,31 +307,76 @@ def fmt_tokens(n):
 # ---------------------------------------------------------------- live state
 
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+SESSIONS_DIR = os.path.join(CLAUDE_DIR, "sessions")
 # state in ~/.claude/sessions/<pid>.json -> sidebar status
 LIVE_STATUS = {"busy": "working", "waiting": "waiting", "idle": "idle"}
-_session_cache = {}
+_session_cache = {}   # path -> (mtime, data)
+_job_files = {}       # background job id -> session file
 
 
-def session_state(pid):
-    """(state, since) that Claude Code writes for its process, or None."""
-    path = os.path.join(CLAUDE_DIR, "sessions", f"{pid}.json")
+def _read_session(path):
     try:
         mtime = os.stat(path).st_mtime_ns
     except OSError:
         return None
-    hit = _session_cache.get(pid)
+    hit = _session_cache.get(path)
     if hit and hit[0] == mtime:
         return hit[1]
-    state = None
     try:
         with open(path) as f:
             data = json.load(f)
-        if data.get("status") in LIVE_STATUS:
-            state = (data["status"], int((data.get("statusUpdatedAt") or 0) / 1000) or None)
-    except (OSError, ValueError, TypeError, AttributeError):
-        pass
-    _session_cache[pid] = (mtime, state)
-    return state
+        if not isinstance(data, dict):
+            data = None
+    except (OSError, ValueError):
+        return hit[1] if hit else None  # file is being rewritten: keep the old data
+    _session_cache[path] = (mtime, data)
+    return data
+
+
+def session_info(pid):
+    """What Claude Code writes about the session of this process, or None.
+
+    A pane can run only a client of a background session ("parkedJobId").
+    Then the state is in the session file of the background process."""
+    data = _read_session(os.path.join(SESSIONS_DIR, f"{pid}.json"))
+    job = data and data.get("parkedJobId")
+    if job:
+        path = _job_files.get(job)
+        bg = _read_session(path) if path else None
+        if not bg or bg.get("jobId") != job:
+            bg = None
+            try:
+                names = os.listdir(SESSIONS_DIR)
+            except OSError:
+                names = []
+            for name in names:
+                if name.endswith(".json"):
+                    d = _read_session(os.path.join(SESSIONS_DIR, name))
+                    if d and d.get("jobId") == job:
+                        _job_files[job], bg = os.path.join(SESSIONS_DIR, name), d
+                        break
+        if bg:
+            data = bg
+    if not data or data.get("status") not in LIVE_STATUS:
+        return None
+    return data
+
+
+def live_transcript(info):
+    """Transcript of the live session (a background session has its own)."""
+    sid, cwd = info.get("sessionId"), info.get("cwd")
+    if not sid or not cwd:
+        return None
+    path = os.path.join(CLAUDE_DIR, "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd), sid + ".jsonl")
+    return path if os.path.exists(path) else None
+
+
+def resolve_status(hook, live):
+    """Sidebar status from the hook status and Claude Code's live state."""
+    new = LIVE_STATUS[live]
+    if new == "idle" and hook == "done":
+        return "done"  # finished while you did not look: only the hook knows
+    return new
 
 
 # ---------------------------------------------------------------- model
@@ -348,17 +403,16 @@ def collect_agents(home_session=None):
             ts = int(p["@agent_ts"])
         except ValueError:
             ts = None
-        tokens, interrupted = transcript_info(p["@agent_transcript"] or guess_transcript(cwd))
-        live = session_state(pid) if pid else None
-        if live:
-            # Claude Code's own state is exact, also after Esc or Ctrl+C.
-            # The hook adds "done": finished while you did not look.
-            state, since = live
-            new = LIVE_STATUS.get(state)
-            if new == "idle" and status in ("done", "idle"):
-                new = None
-            if new and new != status:
-                status, ts = new, since
+        hook = status
+        info = session_info(pid) if pid else None
+        transcript = (info and live_transcript(info)) or p["@agent_transcript"] or guess_transcript(cwd)
+        tokens, interrupted, _ = transcript_info(transcript)
+        if info:
+            # Claude Code's own state is exact, also after Esc or Ctrl+C
+            new = resolve_status(hook, info["status"])
+            if new != status:
+                status = new
+                ts = int((info.get("statusUpdatedAt") or 0) / 1000) or ts
         elif (status in ("working", "waiting") and interrupted
                 and (ts is None or interrupted >= ts + 1)):
             # older Claude Code without session files: interrupted or rejected,
@@ -366,13 +420,22 @@ def collect_agents(home_session=None):
             status, ts = "idle", int(interrupted)
             tmux("set-option", "-p", "-t", p["pane_id"], "@agent_status", status, ";",
                  "set-option", "-p", "-t", p["pane_id"], "@agent_ts", str(ts))
+        name = p["@agent_name"]
+        if not name and p["automatic-rename"] == "1":
+            # the automatic window name is the command of the active pane
+            # (claude, python3, ...), so use the repo or directory name
+            git = git_info(cwd)
+            name = os.path.basename((git[0] if git else cwd).rstrip("/")) or cwd
         agents.append({
             "pane": p["pane_id"],
             "session": p["session_name"],
             "window_id": p["window_id"],
             "order": (int(p["window_index"]), int(p["pane_index"])),
             "window": p["window_name"],
-            "name": p["@agent_name"],
+            "name": name,
+            "pid": pid,
+            "hook": hook,
+            "transcript": transcript,
             "cwd": cwd,
             "git": git_info(cwd),
             "tokens": tokens,
@@ -436,6 +499,7 @@ def jump(agent, focus=True):
     if agent["status"] == "done":
         # seen -> no longer highlighted
         tmux("set-option", "-p", "-t", pane, "@agent_status", "idle")
+        agent["status"] = agent["hook"] = "idle"
 
 
 # ---------------------------------------------------------------- TUI
@@ -460,6 +524,8 @@ class UI:
         self.drawn_sel = None
         # agent data comes from a worker thread, so the UI never blocks on it
         self.pending = None
+        self.live_prev = {}  # pane -> last live state seen by refresh_live
+        self.finishing = {}  # pane -> deadline to find "finished" in the transcript
         self.wake = threading.Event()
         self.last_draw = 0.0
         curses.curs_set(0)
@@ -578,6 +644,46 @@ class UI:
             if only:
                 agents = [a for a in agents if a["session"] == home]
             self.pending = agents
+
+    def refresh_live(self):
+        """Apply Claude Code's live state at once (every tick). It only stats
+        a few small files, so it is cheap. True when a status changed."""
+        changed = False
+        now = time.monotonic()
+        for a in self.agents:
+            info = session_info(a["pid"]) if a.get("pid") else None
+            if not info:
+                continue
+            live, pane = info["status"], a["pane"]
+            prev, self.live_prev[pane] = self.live_prev.get(pane), live
+            if live != "idle":
+                self.finishing.pop(pane, None)
+            elif prev == "busy" and self.visible:
+                # The turn ended: finished, or you stopped it (Esc, Ctrl+C).
+                # The transcript tells which. It can lag a moment, so look
+                # again for up to FINISH_WAIT_SEC.
+                self.finishing[pane] = now + FINISH_WAIT_SEC
+            if pane in self.finishing:
+                if transcript_info(a.get("transcript"))[2]:
+                    del self.finishing[pane]
+                    self.mark_finished(a)
+                elif now > self.finishing[pane]:
+                    del self.finishing[pane]  # stopped by you: stays idle
+            new = resolve_status(a["hook"], live)
+            if new != a["status"]:
+                a["status"] = new
+                changed = True
+        return changed
+
+    def mark_finished(self, a):
+        """Green if you did not look at the agent when it finished. The Stop
+        hook does the same, but no hook runs for a background session."""
+        pane = a["pane"]
+        seen = tmux("display-message", "-p", "-t", pane,
+                    "#{&&:#{pane_active},#{window_active_clients}}").strip() == "1"
+        a["hook"] = "idle" if seen else "done"
+        tmux("set-option", "-p", "-t", pane, "@agent_status", a["hook"], ";",
+             "set-option", "-p", "-t", pane, "@agent_ts", str(int(time.time())))
 
     def take_data(self):
         """Swap in new agent data from the worker. True if there was some."""
@@ -795,6 +901,7 @@ class UI:
                 if state is False:
                     return
                 dirty = True
+            dirty |= self.refresh_live()
             # periodic redraw keeps the "working" spinner moving
             if dirty or (self.visible and time.monotonic() - self.last_draw >= 0.5):
                 self.sync_sel()
