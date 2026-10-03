@@ -13,7 +13,7 @@ You can move between agents with `j`/`k` and show an agent's window with `Enter`
  AGENTS ●1 ●1 ◐1
 ─────────────────────────────────────────
 ━━ agents ◆ ●1 ◐1 ━━━━━━━━━━━━━━━━━━━━━━━
-▶◓ 1 auth                           142k
+ ◓ 1 auth                           142k
    ⎇ main
    ⌂ ~/repos/app
  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄

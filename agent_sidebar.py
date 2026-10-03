@@ -67,7 +67,7 @@ def tmux(*args, check=False):
 
 
 PANE_FIELDS = [
-    "pane_id", "pane_pid", "session_name", "window_index", "window_name",
+    "pane_id", "pane_pid", "session_name", "window_id", "window_index", "window_name",
     "pane_index", "pane_title", "pane_current_path", "pane_active",
     "window_active", "session_attached",
     "@agent_status", "@agent_ts", "@agent_name", "@agent_sidebar",
@@ -271,6 +271,7 @@ def collect_agents(home_session=None):
         agents.append({
             "pane": p["pane_id"],
             "session": p["session_name"],
+            "window_id": p["window_id"],
             "order": (int(p["window_index"]), int(p["pane_index"])),
             "window": p["window_name"],
             "name": p["@agent_name"],
@@ -279,8 +280,6 @@ def collect_agents(home_session=None):
             "tokens": context_tokens(p["@agent_transcript"] or guess_transcript(cwd)),
             "status": status if status in STATUS else "unknown",
             "ts": ts,
-            "focused": (p["pane_active"] == "1" and p["window_active"] == "1"
-                        and p["session_attached"] != "0"),
         })
     # home session first, then the others alphabetically
     agents.sort(key=lambda a: (a["session"] != home_session, a["session"], a["order"]))
@@ -397,11 +396,11 @@ class UI:
             "#{@agent_sidebar_on}", "#{@agent_sidebar_sel}", "#{@agent_sidebar_only}",
             "#{@agent_sidebar_home}", "#{session_name}", "#{window_panes}",
             "#{&&:#{window_active},#{session_attached}}", "#{pane_width}",
-            "#{@agent_sidebar_bg}", "#{P:#{?pane_active,#{pane_id},}}"]))
+            "#{@agent_sidebar_bg}", "#{P:#{?pane_active,#{pane_id},}}", "#{window_id}"]))
         parts = out.rstrip("\n").split(SEP)
-        if len(parts) != 10 or parts[0] != "1":
+        if len(parts) != 11 or parts[0] != "1":
             return False
-        on, sel, only, home, own, panes, visible, width, bg, active = parts
+        on, sel, only, home, own, panes, visible, width, bg, active, window = parts
         if bg.isdigit() and int(bg) != self.bg:
             self.set_bg(int(bg))
             self.bg_shown_until = time.monotonic() + 3
@@ -413,18 +412,35 @@ class UI:
         # cheap changes: redraw from the data we already have
         redraw = (sel != self.shared_sel or visible == "1" and active != self.active_pane)
         # changes that need fresh data
+        became_visible = visible == "1" and not self.visible
         changed = ((only == "1") != self.only_home or home != self.home or own != self.own
-                   or visible == "1" and not self.visible)
+                   or became_visible)
+        focus_moved = visible == "1" and active != self.active_pane
         self.shared_sel, self.only_home = sel, only == "1"
         self.home, self.own, self.visible = home or own, own, visible == "1"
         self.active_pane = active
-        # the selection follows the agent you move into with tmux keys or scripts
-        if self.visible and active != sel and any(a["pane"] == active for a in self.agents):
-            self.shared_sel = active
-            tmux("set-option", "-g", "@agent_sidebar_sel", active)
+        if became_visible or focus_moved:
+            self.follow(window, active)
         if changed:
             return "refresh"
         return "redraw" if redraw else True
+
+    def follow(self, window, active):
+        """The selection follows you when you move with tmux keys or scripts.
+
+        Focus in an agent pane -> select that agent. Otherwise (focus in the
+        sidebar) select an agent of this window, unless one is selected already.
+        """
+        mine = [a["pane"] for a in self.agents if a["window_id"] == window]
+        if active in mine:
+            target = active
+        elif mine and self.shared_sel not in mine:
+            target = mine[0]
+        else:
+            return
+        if target != self.shared_sel:
+            self.shared_sel = target
+            tmux("set-option", "-g", "@agent_sidebar_sel", target)
 
     def select(self, i):
         if 0 <= i < len(self.agents):
@@ -550,9 +566,6 @@ class UI:
         sym, col, _ = STATUS[a["status"]]
         if a["status"] == "working":
             sym = SPINNER[int(time.time() * 2) % len(SPINNER)]
-        # the active pane of a visible sidebar's window is where the client is
-        focused = a["pane"] == self.active_pane if self.visible else a["focused"]
-        self.put(y, 0, "▶" if focused else " ", c["cyan"])
         self.put(y, 1, sym, c[col] | curses.A_BOLD)
         self.put(y, 2, f" {i + 1} {a['name'] or a['window']}", c["text"] | curses.A_BOLD)
         tokens = fmt_tokens(a["tokens"])
