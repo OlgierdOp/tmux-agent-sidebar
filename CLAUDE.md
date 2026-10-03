@@ -43,5 +43,8 @@ export TMUX="$(tmux -L agtest display -p '#{socket_path}'),1,0"
   echo '{"hook_event_name":"Stop"}' | TMUX_PANE=%1 hooks/claude-hook.sh
   ```
 
-- Check the rendered sidebar with `tmux capture-pane -p [-e]`.
+- Check the rendered sidebar with `tmux capture-pane -p [-e]`. Each sidebar stores the agent it shows as the pane option `@agent_sidebar_drawn`.
+- Simulate key presses with `tmux send-keys -K -c <client> <key>`.
+- Read the client's real window and pane with `tmux list-clients -F '#{window_id} #{pane_id}'`. `display -p -c <client>` does not show the client's session.
+- After a change to switching or selection, run a stress test: many random window, session and pane switches with 0–30 ms gaps, then check the visible sidebar.
 - Kill both test servers when you finish.

@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 # ---------------------------------------------------------------- config
@@ -40,7 +41,11 @@ STRINGS = {
 }
 T = STRINGS[LANG]
 
-POLL_SEC = 0.25             # visibility / key polling
+TICK_SEC = 0.1              # main loop tick (new data, spinner); keys wake it at once
+# Safety-net polling of tmux state. Window, session and pane switches do not
+# wait for it: the tmux hooks wake the sidebar with F12 at once.
+POLL_SEC = 1.0
+HIDDEN_POLL_SEC = 2.0
 REFRESH_SEC = 1.0           # data refresh while the pane is visible
 HIDDEN_REFRESH_SEC = 5.0    # ... and while it is hidden
 GIT_TTL_SEC = 3.0
@@ -69,7 +74,7 @@ def tmux(*args, check=False):
 PANE_FIELDS = [
     "pane_id", "pane_pid", "session_name", "window_id", "window_index", "window_name",
     "pane_index", "pane_title", "pane_current_path", "pane_active",
-    "window_active", "session_attached",
+    "window_active",
     "@agent_status", "@agent_ts", "@agent_name", "@agent_sidebar",
     "@agent_transcript",
 ]
@@ -85,8 +90,36 @@ def list_panes():
     return panes
 
 
+def proc_info(pid):
+    """(comm, argv) of a process, or None if it is gone."""
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            comm = f.read().strip()
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            args = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+    except OSError:
+        return None
+    return comm, args
+
+
+HAS_CHILDREN_FILE = os.path.exists(f"/proc/{os.getpid()}/task/{os.getpid()}/children")
+
+
+def child_pids(pid, children=None):
+    if children is not None:
+        return children.get(pid, [])
+    out = []
+    try:
+        for task in os.listdir(f"/proc/{pid}/task"):
+            with open(f"/proc/{pid}/task/{task}/children") as f:
+                out += [int(c) for c in f.read().split()]
+    except OSError:
+        pass
+    return out
+
+
 def process_children():
-    """Map ppid -> [(pid, comm, argv)] built from /proc."""
+    """Fallback without /proc/PID/task/TID/children: map ppid -> [pid] from all of /proc."""
     children = {}
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -94,15 +127,11 @@ def process_children():
         try:
             with open(f"/proc/{entry}/stat") as f:
                 stat = f.read()
-            with open(f"/proc/{entry}/cmdline", "rb") as f:
-                argv = f.read().split(b"\0")
         except OSError:
             continue
         # comm is in parentheses and may contain spaces
-        comm = stat[stat.find("(") + 1:stat.rfind(")")]
         ppid = int(stat[stat.rfind(")") + 2:].split()[1])
-        args = [a.decode(errors="replace") for a in argv if a]
-        children.setdefault(ppid, []).append((int(entry), comm, args))
+        children.setdefault(ppid, []).append(int(entry))
     return children
 
 
@@ -112,24 +141,20 @@ def is_claude(comm, args):
     return any(os.path.basename(a) == "claude" or "claude-code" in a for a in args[:2])
 
 
-def claude_pid_in(pane_pid, children, depth=4):
-    try:
-        with open(f"/proc/{pane_pid}/comm") as f:
-            comm = f.read().strip()
-        with open(f"/proc/{pane_pid}/cmdline", "rb") as f:
-            args = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
-        if is_claude(comm, args):
-            return pane_pid
-    except OSError:
-        pass
-    stack = [(pane_pid, 0)]
-    while stack:
-        pid, d = stack.pop()
-        for child, comm, args in children.get(pid, []):
-            if is_claude(comm, args):
-                return child
-            if d < depth:
-                stack.append((child, d + 1))
+def claude_pid_in(pane_pid, children=None, depth=4):
+    """The claude process in a pane's process tree. Reads only the descendants
+    of the pane, not all of /proc."""
+    level = [pane_pid]
+    for _ in range(depth + 1):
+        nxt = []
+        for pid in level:
+            info = proc_info(pid)
+            if info and is_claude(*info):
+                return pid
+            nxt += child_pids(pid, children)
+        level = nxt
+        if not level:
+            break
     return None
 
 
@@ -252,7 +277,7 @@ def current_session(pane=None):
 
 
 def collect_agents(home_session=None):
-    children = process_children()
+    children = None if HAS_CHILDREN_FILE else process_children()
     agents = []
     for p in list_panes():
         if p["@agent_sidebar"]:
@@ -352,18 +377,22 @@ class UI:
         self.scroll = 0
         self.agents = []
         self.rows = []      # (y_start, y_end, index) for mouse clicks
-        self.own = None     # session this pane is in (◆)
+        self.own = None     # session this pane is in
         self.home = None    # home session: always at the top of the list
         self.only_home = False
         self.shared_sel = ""
         self.visible = True
-        self.last_refresh = 0.0
+        self.loaded = False      # agent data arrived at least once
+        self.last_poll = 0.0
         self.drawn_sel = None
-        self.active_pane = None  # active pane of this window
+        # agent data comes from a worker thread, so the UI never blocks on it
+        self.pending = None
+        self.wake = threading.Event()
+        self.last_draw = 0.0
         curses.curs_set(0)
         curses.use_default_colors()
         curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)
-        self.scr.timeout(int(POLL_SEC * 1000))
+        self.scr.timeout(int(TICK_SEC * 1000))
         palette = {"text": -1, "red": curses.COLOR_RED, "green": curses.COLOR_GREEN,
                    "yellow": curses.COLOR_YELLOW, "blue": curses.COLOR_BLUE,
                    "magenta": curses.COLOR_MAGENTA, "cyan": curses.COLOR_CYAN,
@@ -377,6 +406,9 @@ class UI:
         self.bg = None
         self.bg_shown_until = 0.0
         self.set_bg(SEL_BG)
+        self.alive = self.poll_state() is not False
+        self.wake.set()
+        threading.Thread(target=self.worker, daemon=True).start()
 
     def set_bg(self, bg):
         rich = curses.COLORS >= 256
@@ -391,56 +423,59 @@ class UI:
     # --- shared state in tmux options
 
     def poll_state(self):
-        """Cheap check of visibility and shared state. False = exit."""
+        """Read visibility and shared state from tmux. Returns False to exit,
+        True when something changed (redraw), None when nothing changed."""
+        self.last_poll = time.monotonic()
         out = tmux("display-message", "-p", "-t", self.me, SEP.join([
             "#{@agent_sidebar_on}", "#{@agent_sidebar_sel}", "#{@agent_sidebar_only}",
             "#{@agent_sidebar_home}", "#{session_name}", "#{window_panes}",
-            "#{&&:#{window_active},#{session_attached}}", "#{pane_width}",
-            "#{@agent_sidebar_bg}", "#{P:#{?pane_active,#{pane_id},}}", "#{window_id}"]))
+            # visible = a client shows this window. Not session_attached: tmux
+            # updates that one lazily, so it is stale right after switch-client.
+            "#{?window_active_clients,1,0}", "#{pane_width}",
+            "#{@agent_sidebar_bg}", "#{P:#{?pane_active,#{pane_id},}}", "#{window_id}",
+            "#{@agent_sidebar_focus}"]))
         parts = out.rstrip("\n").split(SEP)
-        if len(parts) != 11 or parts[0] != "1":
+        if len(parts) != 12 or parts[0] != "1":
             return False
-        on, sel, only, home, own, panes, visible, width, bg, active, window = parts
-        if bg.isdigit() and int(bg) != self.bg:
-            self.set_bg(int(bg))
-            self.bg_shown_until = time.monotonic() + 3
+        _, sel, only, home, own, panes, visible, width, bg, active, window, focus = parts
+        if panes == "1":  # alone in the window (the agent exited)
+            return False
         if visible == "1" and width != str(SIDEBAR_WIDTH):
             # tmux scales panes proportionally when the window is resized
             tmux("resize-pane", "-t", self.me, "-x", str(SIDEBAR_WIDTH))
-        if panes == "1":  # alone in the window (the agent exited)
-            return False
-        # cheap changes: redraw from the data we already have
-        redraw = (sel != self.shared_sel or visible == "1" and active != self.active_pane)
-        # changes that need fresh data
-        became_visible = visible == "1" and not self.visible
-        changed = ((only == "1") != self.only_home or home != self.home or own != self.own
-                   or became_visible)
-        focus_moved = visible == "1" and active != self.active_pane
-        self.shared_sel, self.only_home = sel, only == "1"
-        self.home, self.own, self.visible = home or own, own, visible == "1"
-        self.active_pane = active
-        if became_visible or focus_moved:
-            self.follow(window, active)
-        if changed:
-            return "refresh"
-        return "redraw" if redraw else True
+        changed = False
+        if bg.isdigit() and int(bg) != self.bg:
+            self.set_bg(int(bg))
+            self.bg_shown_until = time.monotonic() + 3
+            changed = True
+        home = home or own
+        if (only == "1") != self.only_home or home != self.home:
+            self.wake.set()  # the agent list itself changes
+            changed = True
+        changed |= sel != self.shared_sel or own != self.own or (visible == "1") != self.visible
+        self.shared_sel, self.only_home, self.home, self.own = sel, only == "1", home, own
+        self.visible = visible == "1"
+        # The selection follows you when you move with tmux keys or scripts.
+        # This compares states, not events: a window+pane pair that differs from
+        # the last one handled is always handled, however fast you switch.
+        key = f"{window}:{active}"
+        if self.visible and self.loaded and key != focus:
+            self.follow(window, active, key)
+            changed = True
+        return True if changed else None
 
-    def follow(self, window, active):
-        """The selection follows you when you move with tmux keys or scripts.
-
-        Focus in an agent pane -> select that agent. Otherwise (focus in the
-        sidebar) select an agent of this window, unless one is selected already.
-        """
+    def follow(self, window, active, key):
+        """Focus in an agent pane -> select that agent. Otherwise (focus in the
+        sidebar) select an agent of this window, unless one is selected already."""
         mine = [a["pane"] for a in self.agents if a["window_id"] == window]
+        target = self.shared_sel
         if active in mine:
             target = active
         elif mine and self.shared_sel not in mine:
             target = mine[0]
-        else:
-            return
-        if target != self.shared_sel:
-            self.shared_sel = target
-            tmux("set-option", "-g", "@agent_sidebar_sel", target)
+        self.shared_sel = target
+        tmux("set-option", "-g", "@agent_sidebar_sel", target, ";",
+             "set-option", "-g", "@agent_sidebar_focus", key)
 
     def select(self, i):
         if 0 <= i < len(self.agents):
@@ -458,16 +493,26 @@ class UI:
 
     def sync_sel(self):
         self.sel = next((i for i, a in enumerate(self.agents) if a["pane"] == self.shared_sel),
-                        self.sel)
+                        max(0, min(self.sel, len(self.agents) - 1)))
 
-    def refresh_data(self):
-        agents = collect_agents(self.home)
-        if self.only_home:
-            agents = [a for a in agents if a["session"] == self.home]
-        self.agents = agents
-        self.sel = next((i for i, a in enumerate(agents) if a["pane"] == self.shared_sel),
-                        max(0, min(self.sel, len(agents) - 1)))
-        self.last_refresh = time.monotonic()
+    def worker(self):
+        """Collect agent data in the background (process scan, git, tokens)."""
+        while True:
+            self.wake.wait(REFRESH_SEC if self.visible else HIDDEN_REFRESH_SEC)
+            self.wake.clear()
+            home, only = self.home, self.only_home
+            agents = collect_agents(home)
+            if only:
+                agents = [a for a in agents if a["session"] == home]
+            self.pending = agents
+
+    def take_data(self):
+        """Swap in new agent data from the worker. True if there was some."""
+        agents, self.pending = self.pending, None
+        if agents is None:
+            return False
+        self.agents, self.loaded = agents, True
+        return True
 
     # --- drawing
 
@@ -501,6 +546,7 @@ class UI:
         return items
 
     def draw(self):
+        self.last_draw = time.monotonic()
         self.scr.erase()
         h, w = self.scr.getmaxyx()
         self.put(0, 1, T["title"], curses.A_BOLD)
@@ -548,8 +594,7 @@ class UI:
 
     def draw_header(self, y, session, w):
         attr = self.colors["cyan"] | curses.A_BOLD
-        own = " ◆" if session == self.own else ""
-        head = f"━━ {session}{own} "
+        head = f"━━ {session} "
         self.put(y, 0, head, attr)
         x = len(head)
         for label, col in self.counts_label([a for a in self.agents if a["session"] == session]):
@@ -636,6 +681,7 @@ class UI:
             self.bg_shown_until = time.monotonic() + 3
         elif k == ord("r"):
             _git_cache.clear()
+            self.wake.set()
         elif k == curses.KEY_MOUSE:
             try:
                 _, _, my, _, _ = curses.getmouse()
@@ -645,33 +691,41 @@ class UI:
                 if y0 <= my <= y1:
                     self.go(i)
 
-    def update(self, state):
-        """Redraw at once from the data we have, then refresh the data if needed."""
-        if state in ("redraw", "refresh"):
-            self.sync_sel()
-            self.draw()
-        age = time.monotonic() - self.last_refresh
-        if state == "refresh" or age >= (REFRESH_SEC if self.visible else HIDDEN_REFRESH_SEC):
-            self.refresh_data()
-            self.draw()
-
     def run(self):
-        if not self.poll_state():
-            return
-        self.update("refresh")
-        while True:
+        while self.alive:
             k = self.scr.getch()
-            if k not in (-1, curses.KEY_RESIZE, curses.KEY_F12):
+            dirty = False
+            if k == curses.KEY_F12:
+                # a tmux hook (window switch) or another sidebar: check state now;
+                # drain queued F12s so a burst of switches costs one check
+                self.scr.nodelay(True)
+                while (k := self.scr.getch()) == curses.KEY_F12:
+                    pass
+                self.scr.timeout(int(TICK_SEC * 1000))
+                if k != -1:
+                    curses.ungetch(k)
+                k = curses.KEY_F12
+            elif k not in (-1, curses.KEY_RESIZE):
                 self.handle_key(k)
-            # F12 = a tmux hook (window switch) or another sidebar wants a redraw now
-            state = self.poll_state()
-            if not state:
-                return
-            if k not in (-1, curses.KEY_F12) and state is True:
-                state = "redraw"
-            self.update(state)
-            if state is True and self.visible:
-                self.draw()  # spinner animation
+                dirty = True
+            elif k == curses.KEY_RESIZE:
+                dirty = True
+            poll_every = POLL_SEC if self.visible else HIDDEN_POLL_SEC
+            if k == curses.KEY_F12 or dirty or time.monotonic() - self.last_poll >= poll_every:
+                state = self.poll_state()
+                if state is False:
+                    return
+                dirty |= bool(state)
+            if self.take_data():
+                # new data may make a pending focus-follow possible
+                state = self.poll_state()
+                if state is False:
+                    return
+                dirty = True
+            # periodic redraw keeps the "working" spinner moving
+            if dirty or (self.visible and time.monotonic() - self.last_draw >= 0.5):
+                self.sync_sel()
+                self.draw()
 
 
 # ---------------------------------------------------------------- commands

@@ -38,7 +38,7 @@ case "$event" in
   Stop)
     # if you are looking at this pane right now, do not highlight it
     seen=$(tmux display-message -p -t "$pane" \
-      '#{&&:#{pane_active},#{&&:#{window_active},#{session_attached}}}' 2>/dev/null)
+      '#{&&:#{pane_active},#{window_active_clients}}' 2>/dev/null)
     if [ "$seen" = 1 ]; then set_status idle; else set_status done; fi ;;
   SessionEnd)
     tmux set-option -p -u -t "$pane" @agent_status \; \
