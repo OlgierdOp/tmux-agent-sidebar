@@ -83,6 +83,7 @@ Keys in the sidebar:
 |-----------------|--------|
 | `j` / `k`       | Move the selection |
 | `g` / `G`       | First / last agent |
+| `J` / `K`       | Move the session of the selected agent down / up |
 | `Enter` / `o`   | Show the agent's window. The cursor stays in the sidebar. |
 | `i`             | Go into the agent's pane |
 | `1`–`9`         | Show the agent with this number |
@@ -100,7 +101,9 @@ The selection follows you. If you move to another agent with tmux keys or a scri
 
 ### Sessions
 
-Agents are grouped by tmux session. The home session is the session where you turned the sidebar on, and it is always at the top.
+Agents are grouped by tmux session. The home session is the session where you turned the sidebar on, and it is at the top by default.
+
+To change the order, select an agent and press `J` (session down) or `K` (session up). The agent numbers (`1`–`9`) follow the new order. All sidebars use the same order. It is stored in `@agent_sidebar_order` until tmux restarts. Sessions that are not in the order yet (new sessions) go after the others.
 
 ### Statuses
 
@@ -131,6 +134,7 @@ To choose a background color, press `c` in the sidebar until you like the color.
   - `@agent_sidebar_only`
   - `@agent_sidebar_home`
   - `@agent_sidebar_bg`
+  - `@agent_sidebar_order`
 - **Fast selection sync.** A selection change sends `F12` to the other sidebar panes, so they redraw at once. `Enter` waits (max ~150 ms) until the target window's sidebar has drawn the new selection, then it switches the window.
 - **Window, session and pane switches.** The tmux hooks `session-window-changed`, `client-session-changed`, `after-select-pane` and `after-new-window` do two things:
   - they add a sidebar to a window on the first visit,
