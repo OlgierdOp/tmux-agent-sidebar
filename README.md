@@ -170,6 +170,7 @@ To choose a background color, press `c` in the sidebar until you like the color.
 | `hooks/claude-hook.sh` | Claude Code hook that writes the agent status into tmux |
 | `agent-sidebar.tmux` | tmux key bindings and hooks |
 | `install.sh` | Installer |
+| `ROADMAP.md` | Planned features and lessons from herdr |
 
 ## Uninstall
 
