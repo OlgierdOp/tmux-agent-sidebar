@@ -528,6 +528,8 @@ class UI:
         self.home = None    # home session: always at the top of the list
         self.only_home = False
         self.order = []     # session order set with J/K, shared by all sidebars
+        self.gen = ""       # changes when J/K swaps windows: collect again
+        self.window = ""    # window of this sidebar
         self.shared_sel = ""
         self.visible = True
         self.loaded = False      # agent data arrived at least once
@@ -583,11 +585,13 @@ class UI:
             # updates that one lazily, so it is stale right after switch-client.
             "#{?window_active_clients,1,0}", "#{pane_width}",
             "#{@agent_sidebar_bg}", "#{P:#{?pane_active,#{pane_id},}}", "#{window_id}",
-            "#{@agent_sidebar_focus}", "#{@agent_sidebar_order}"]))
+            "#{@agent_sidebar_focus}", "#{@agent_sidebar_order}", "#{@agent_sidebar_gen}"]))
         parts = out.rstrip("\n").split(SEP)
-        if len(parts) != 13 or parts[0] != "1":
+        if len(parts) != 14 or parts[0] != "1":
             return False
-        _, sel, only, home, own, panes, visible, width, bg, active, window, focus, order = parts
+        (_, sel, only, home, own, panes, visible, width, bg, active, window, focus,
+         order, gen) = parts
+        self.window = window
         if panes == "1":  # alone in the window (the agent exited)
             return False
         if visible == "1" and width != str(SIDEBAR_WIDTH):
@@ -600,6 +604,9 @@ class UI:
             sort_agents(self.agents, self.home, order)
             self.wake.set()
             changed = True
+        if gen != self.gen:
+            self.gen = gen
+            self.wake.set()  # windows were swapped
         if bg.isdigit() and int(bg) != self.bg:
             self.set_bg(int(bg))
             self.bg_shown_until = time.monotonic() + 3
@@ -647,6 +654,47 @@ class UI:
                     cmd += [";", "send-keys", "-t", pane, "F12"]
             tmux(*cmd)
 
+    def move(self, delta):
+        """J/K: swap the selected agent with the next (+1) or previous (-1)
+        agent of its session. The tmux windows swap, so the window numbers
+        change too. At the edge of a session, move the whole session."""
+        if not self.agents:
+            return
+        a = self.agents[self.sel]
+        j = self.sel + delta
+        b = self.agents[j] if 0 <= j < len(self.agents) else None
+        if b is None or b["session"] != a["session"]:
+            self.move_session(delta)
+            return
+        if a["window_id"] == b["window_id"]:
+            cmd = ["swap-pane", "-d", "-s", a["pane"], "-t", b["pane"]]
+            a["order"], b["order"] = b["order"], a["order"]
+        else:
+            # -d and select-window: you keep looking at the same window
+            cmd = ["swap-window", "-d", "-s", a["window_id"], "-t", b["window_id"],
+                   ";", "select-window", "-t", self.window]
+            wa, wb = a["order"][0], b["order"][0]
+            for x in self.agents:
+                if x["window_id"] == a["window_id"]:
+                    x["order"] = (wb, x["order"][1])
+                elif x["window_id"] == b["window_id"]:
+                    x["order"] = (wa, x["order"][1])
+        sort_agents(self.agents, self.home, self.order)
+        self.sync_sel()  # the selection stays on the same agent
+        # the other sidebars collect the new order at once (@agent_sidebar_gen)
+        self.gen = str(time.time_ns())
+        cmd += [";", "set-option", "-g", "@agent_sidebar_gen", self.gen]
+        self.poke_others(cmd)
+
+    def poke_others(self, cmd):
+        """Run a tmux command and send F12 to the other sidebars, so they
+        check the shared state now."""
+        for line in tmux("list-panes", "-a", "-F", "#{pane_id}\t#{@agent_sidebar}").splitlines():
+            pane, flag = line.split("\t")
+            if flag == "1" and pane != self.me:
+                cmd += [";", "send-keys", "-t", pane, "F12"]
+        tmux(*cmd)
+
     def move_session(self, delta):
         """Move the session of the selected agent down (+1) or up (-1)."""
         if not self.agents or self.only_home:
@@ -660,13 +708,7 @@ class UI:
         self.order = sessions
         sort_agents(self.agents, self.home, sessions)
         self.sync_sel()  # the selection stays on the same agent
-        # store it and poke the other sidebars, like select()
-        cmd = ["set-option", "-g", "@agent_sidebar_order", ORDER_SEP.join(sessions)]
-        for line in tmux("list-panes", "-a", "-F", "#{pane_id}\t#{@agent_sidebar}").splitlines():
-            pane, flag = line.split("\t")
-            if flag == "1" and pane != self.me:
-                cmd += [";", "send-keys", "-t", pane, "F12"]
-        tmux(*cmd)
+        self.poke_others(["set-option", "-g", "@agent_sidebar_order", ORDER_SEP.join(sessions)])
 
     def sync_sel(self):
         self.sel = next((i for i, a in enumerate(self.agents) if a["pane"] == self.shared_sel),
@@ -677,11 +719,11 @@ class UI:
         while True:
             self.wake.wait(REFRESH_SEC if self.visible else HIDDEN_REFRESH_SEC)
             self.wake.clear()
-            home, only, order = self.home, self.only_home, self.order
+            home, only, order, gen = self.home, self.only_home, self.order, self.gen
             agents = collect_agents(home, order)
             if only:
                 agents = [a for a in agents if a["session"] == home]
-            self.pending = agents
+            self.pending = (gen, agents)
 
     def refresh_live(self):
         """Apply Claude Code's live state at once (every tick). It only stats
@@ -725,9 +767,12 @@ class UI:
 
     def take_data(self):
         """Swap in new agent data from the worker. True if there was some."""
-        agents, self.pending = self.pending, None
-        if agents is None:
+        data, self.pending = self.pending, None
+        if data is None:
             return False
+        gen, agents = data
+        if gen != self.gen:
+            return False  # collected before J/K swapped windows: wait for new data
         # the worker may have sorted with an older order (J/K just now)
         sort_agents(agents, self.home, self.order)
         self.agents, self.loaded = agents, True
@@ -879,9 +924,9 @@ class UI:
         elif k == ord("G"):
             self.select(len(self.agents) - 1)
         elif k == ord("J"):
-            self.move_session(1)
+            self.move(1)
         elif k == ord("K"):
-            self.move_session(-1)
+            self.move(-1)
         elif k in (10, 13, curses.KEY_ENTER, ord("o")):
             self.go(self.sel)
         elif k == ord("i"):
