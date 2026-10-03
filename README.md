@@ -106,10 +106,10 @@ Agents are grouped by tmux session. The home session is the session where you tu
 
 | Symbol      | Meaning |
 |-------------|---------|
-| `●` red     | Waiting for you: a permission prompt or a question |
+| `●` red     | Waiting for you to accept: a permission prompt or a question |
 | `●` green   | Finished, and you did not look at it yet. It turns idle when you show the agent. |
 | `◐` yellow  | Working |
-| `○` gray    | Idle |
+| `○` gray    | Idle. Also after you press `Esc` or reject a permission prompt. |
 | `?`         | No hook data yet (for example, a session started before the installation) |
 
 ## Configuration
@@ -141,6 +141,8 @@ To choose a background color, press `c` in the sidebar until you like the color.
 - **Non-blocking UI.** A worker thread collects the agent data (process tree, git, tokens). The main loop only handles keys, `F12` and drawing, so it never waits for the data.
 - **Agent detection.** The sidebar reads `tmux list-panes -a` and the process tree of each pane (`/proc/PID/task/TID/children`, with a full `/proc` scan as fallback). Any pane with a `claude` process in it is an agent.
 - **Status.** `hooks/claude-hook.sh` runs on Claude Code hook events. It stores `@agent_status`, `@agent_ts` and `@agent_transcript` as tmux pane options. There are no state files, and the data goes away with the pane.
+  - Only a permission prompt or a question makes the dot red. A late notification after the turn ended does not.
+  - Claude Code runs no hook when you press `Esc` or reject a permission prompt. The sidebar finds the `[Request interrupted by user]` message at the end of the transcript and sets the status to idle. As a fallback, the `idle_prompt` notification (after about 60 s) does the same.
 - **Tokens.** The context size comes from the `usage` of the last assistant message in the session transcript (input + cache + output tokens).
 - **Git.** The sidebar runs `git rev-parse` in the agent's working directory. `[wt]` marks a linked worktree.
 - **Refresh.** The visible sidebar refreshes its data every 1 s, hidden ones every 5 s. As a safety net, the visible sidebar also polls tmux state every 1 s (hidden: 2 s).

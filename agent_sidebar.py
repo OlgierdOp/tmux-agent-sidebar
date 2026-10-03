@@ -12,6 +12,7 @@ Usage:
 """
 
 import curses
+from datetime import datetime
 import json
 import os
 import re
@@ -222,41 +223,65 @@ def guess_transcript(cwd):
     return max(files, key=os.path.getmtime) if files else None
 
 
-def context_tokens(path):
-    """Context size from the last assistant reply in the transcript."""
-    if not path:
+INTERRUPT_MARK = b"[Request interrupted by user"
+
+
+def _entry_time(entry):
+    try:
+        return datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00")).timestamp()
+    except (KeyError, AttributeError, ValueError):
         return None
+
+
+def transcript_info(path):
+    """(context tokens, interrupt time) from the transcript.
+
+    Tokens come from the last assistant reply. The interrupt time is set when
+    the last message of the main chain is "[Request interrupted by user...]":
+    you pressed Esc or rejected a permission prompt. Claude Code runs no hook
+    for this, so the sidebar finds it here."""
+    if not path:
+        return None, None
     try:
         st = os.stat(path)
     except OSError:
-        return None
+        return None, None
     key = (st.st_mtime_ns, st.st_size)
     hit = _token_cache.get(path)
     if hit and hit[0] == key:
         return hit[1]
-    tokens = None
+    tokens = interrupted = None
+    seen_last = False
     try:
         with open(path, "rb") as f:
             f.seek(max(0, st.st_size - 512 * 1024))
             lines = f.read().splitlines()
         for line in reversed(lines):
-            if b'"usage"' not in line:
+            if seen_last and b'"usage"' not in line:
                 continue
             try:
                 entry = json.loads(line)
             except ValueError:
                 continue
-            if entry.get("isSidechain") or entry.get("type") != "assistant":
+            if entry.get("isSidechain") or entry.get("type") not in ("user", "assistant"):
                 continue
-            u = entry.get("message", {}).get("usage") or {}
+            if not seen_last:
+                seen_last = True
+                if entry["type"] == "user" and INTERRUPT_MARK in line:
+                    interrupted = _entry_time(entry)
+            if entry["type"] != "assistant":
+                continue
+            u = entry.get("message", {}).get("usage")
+            if not u:
+                continue
             tokens = sum(u.get(k) or 0 for k in (
                 "input_tokens", "cache_creation_input_tokens",
                 "cache_read_input_tokens", "output_tokens"))
             break
     except OSError:
         pass
-    _token_cache[path] = (key, tokens)
-    return tokens
+    _token_cache[path] = (key, (tokens, interrupted))
+    return tokens, interrupted
 
 
 def fmt_tokens(n):
@@ -293,6 +318,13 @@ def collect_agents(home_session=None):
             ts = int(p["@agent_ts"])
         except ValueError:
             ts = None
+        tokens, interrupted = transcript_info(p["@agent_transcript"] or guess_transcript(cwd))
+        if (status in ("working", "waiting") and interrupted
+                and (ts is None or interrupted >= ts + 1)):
+            # interrupted or rejected: no hook runs, so store the change here
+            status, ts = "idle", int(interrupted)
+            tmux("set-option", "-p", "-t", p["pane_id"], "@agent_status", status, ";",
+                 "set-option", "-p", "-t", p["pane_id"], "@agent_ts", str(ts))
         agents.append({
             "pane": p["pane_id"],
             "session": p["session_name"],
@@ -302,7 +334,7 @@ def collect_agents(home_session=None):
             "name": p["@agent_name"],
             "cwd": cwd,
             "git": git_info(cwd),
-            "tokens": context_tokens(p["@agent_transcript"] or guess_transcript(cwd)),
+            "tokens": tokens,
             "status": status if status in STATUS else "unknown",
             "ts": ts,
         })

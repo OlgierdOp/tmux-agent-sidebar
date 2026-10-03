@@ -27,14 +27,16 @@ case "$event" in
     [ "$current" = working ] || set_status working ;;
   PermissionRequest)                    set_status waiting ;;
   Notification)
+    # Red only for a permission prompt or a question. A late notification
+    # after the turn ended (done/idle) does not make it red again.
     type=$(jq -r '.notification_type // empty' <<<"$input")
-    msg=$(jq -r '.message // empty' <<<"$input")
-    # "idle" after finished work keeps "done". Anything else (permission, question) -> waiting
-    if [ "$type" = idle_prompt ] || [[ "$msg" == *"waiting for your input"* ]]; then
-      [ "$current" = done ] || [ "$current" = idle ] || set_status waiting
-    else
-      set_status waiting
-    fi ;;
+    case "$type" in
+      permission_prompt|elicitation_dialog)
+        [ "$current" = working ] && set_status waiting ;;
+      idle_prompt)
+        # the prompt is idle but no Stop came (Esc or a rejected permission)
+        { [ "$current" = working ] || [ "$current" = waiting ]; } && set_status idle ;;
+    esac ;;
   Stop)
     # if you are looking at this pane right now, do not highlight it
     seen=$(tmux display-message -p -t "$pane" \
