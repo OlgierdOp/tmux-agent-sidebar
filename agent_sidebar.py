@@ -360,8 +360,7 @@ class UI:
         self.visible = True
         self.last_refresh = 0.0
         self.drawn_sel = None
-        self.active_pane = None
-        self.focused = None     # agent pane the client is in, as of the last refresh
+        self.active_pane = None  # active pane of this window
         curses.curs_set(0)
         curses.use_default_colors()
         curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)
@@ -411,16 +410,21 @@ class UI:
             tmux("resize-pane", "-t", self.me, "-x", str(SIDEBAR_WIDTH))
         if panes == "1":  # alone in the window (the agent exited)
             return False
-        changed = (sel != self.shared_sel or (only == "1") != self.only_home
-                   or home != self.home or own != self.own)
-        became_visible = visible == "1" and not self.visible
-        # focus moved to another pane of this window (Ctrl+h/l, select-pane, ...)
-        if visible == "1" and active != self.active_pane:
-            changed = True
-        self.active_pane = active
+        # cheap changes: redraw from the data we already have
+        redraw = (sel != self.shared_sel or visible == "1" and active != self.active_pane)
+        # changes that need fresh data
+        changed = ((only == "1") != self.only_home or home != self.home or own != self.own
+                   or visible == "1" and not self.visible)
         self.shared_sel, self.only_home = sel, only == "1"
         self.home, self.own, self.visible = home or own, own, visible == "1"
-        return "refresh" if changed or became_visible else True
+        self.active_pane = active
+        # the selection follows the agent you move into with tmux keys or scripts
+        if self.visible and active != sel and any(a["pane"] == active for a in self.agents):
+            self.shared_sel = active
+            tmux("set-option", "-g", "@agent_sidebar_sel", active)
+        if changed:
+            return "refresh"
+        return "redraw" if redraw else True
 
     def select(self, i):
         if 0 <= i < len(self.agents):
@@ -445,12 +449,6 @@ class UI:
         if self.only_home:
             agents = [a for a in agents if a["session"] == self.home]
         self.agents = agents
-        # selection follows the agent you moved into with tmux keys / scripts
-        focused = next((a["pane"] for a in agents if a["focused"]), None)
-        if focused and focused != self.focused and focused != self.shared_sel:
-            self.shared_sel = focused
-            tmux("set-option", "-g", "@agent_sidebar_sel", focused)
-        self.focused = focused
         self.sel = next((i for i, a in enumerate(agents) if a["pane"] == self.shared_sel),
                         max(0, min(self.sel, len(agents) - 1)))
         self.last_refresh = time.monotonic()
@@ -552,7 +550,9 @@ class UI:
         sym, col, _ = STATUS[a["status"]]
         if a["status"] == "working":
             sym = SPINNER[int(time.time() * 2) % len(SPINNER)]
-        self.put(y, 0, "▶" if a["focused"] else " ", c["cyan"])
+        # the active pane of a visible sidebar's window is where the client is
+        focused = a["pane"] == self.active_pane if self.visible else a["focused"]
+        self.put(y, 0, "▶" if focused else " ", c["cyan"])
         self.put(y, 1, sym, c[col] | curses.A_BOLD)
         self.put(y, 2, f" {i + 1} {a['name'] or a['window']}", c["text"] | curses.A_BOLD)
         tokens = fmt_tokens(a["tokens"])
@@ -632,26 +632,32 @@ class UI:
                 if y0 <= my <= y1:
                     self.go(i)
 
+    def update(self, state):
+        """Redraw at once from the data we have, then refresh the data if needed."""
+        if state in ("redraw", "refresh"):
+            self.sync_sel()
+            self.draw()
+        age = time.monotonic() - self.last_refresh
+        if state == "refresh" or age >= (REFRESH_SEC if self.visible else HIDDEN_REFRESH_SEC):
+            self.refresh_data()
+            self.draw()
+
     def run(self):
+        if not self.poll_state():
+            return
+        self.update("refresh")
         while True:
+            k = self.scr.getch()
+            if k not in (-1, curses.KEY_RESIZE, curses.KEY_F12):
+                self.handle_key(k)
+            # F12 = a tmux hook (window switch) or another sidebar wants a redraw now
             state = self.poll_state()
             if not state:
                 return
-            k = self.scr.getch()
-            if k == curses.KEY_F12:  # another sidebar changed the selection
-                self.poll_state()
-                self.sync_sel()
-                self.draw()
-                continue
-            if k not in (-1, curses.KEY_RESIZE):
-                self.handle_key(k)
-                state = "refresh"
-            age = time.monotonic() - self.last_refresh
-            if state == "refresh" or age >= (REFRESH_SEC if self.visible else HIDDEN_REFRESH_SEC):
-                self.poll_state()
-                self.refresh_data()
-                self.draw()
-            elif self.visible:
+            if k not in (-1, curses.KEY_F12) and state is True:
+                state = "redraw"
+            self.update(state)
+            if state is True and self.visible:
                 self.draw()  # spinner animation
 
 

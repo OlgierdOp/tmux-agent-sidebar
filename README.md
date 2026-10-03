@@ -132,12 +132,16 @@ To choose a background color, press `c` in the sidebar until you like the color.
   - `@agent_sidebar_home`
   - `@agent_sidebar_bg`
 - **Fast selection sync.** A selection change sends `F12` to the other sidebar panes, so they redraw at once. `Enter` waits (max ~150 ms) until the target window's sidebar has drawn the new selection, then it switches the window.
-- **New windows.** The tmux hooks `session-window-changed`, `client-session-changed` and `after-new-window` add a sidebar to a window on the first visit. tmux evaluates the condition, so a normal window switch starts no process.
+- **Window and session switches.** The tmux hooks `session-window-changed`, `client-session-changed` and `after-new-window` do two things:
+  - they add a sidebar to a window on the first visit,
+  - they send `F12` to the sidebar of the window you switch to. The sidebar redraws at once (~20 ms) from the data it already has, and then refreshes its data.
+
+  tmux evaluates the conditions itself, and `run-shell -C` runs a tmux command, so a normal switch starts no process.
 - **Agent detection.** The sidebar reads `tmux list-panes -a` and the process tree in `/proc`. Any pane with a `claude` process in it is an agent.
 - **Status.** `hooks/claude-hook.sh` runs on Claude Code hook events. It stores `@agent_status`, `@agent_ts` and `@agent_transcript` as tmux pane options. There are no state files, and the data goes away with the pane.
 - **Tokens.** The context size comes from the `usage` of the last assistant message in the session transcript (input + cache + output tokens).
 - **Git.** The sidebar runs `git rev-parse` in the agent's working directory. `[wt]` marks a linked worktree.
-- **Hidden panes** refresh their data every 5 s. The visible pane refreshes every 1 s and checks focus changes every 250 ms.
+- **Refresh.** Hidden sidebar panes refresh their data every 5 s. The visible pane refreshes every 1 s and checks focus changes every 250 ms.
 
 ## Files
 
